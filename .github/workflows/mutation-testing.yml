@@ -71,7 +71,6 @@ jobs:
           ctest --test-dir build-mull --show-only=json-v1 > ctest-tests.json
           cat ctest-tests.json
 
-      
       - name: Run Mull on discovered test executables
         run: |
           mkdir -p mutation-results
@@ -81,7 +80,6 @@ jobs:
           import os
           import re
           import subprocess
-          from pathlib import Path
 
           with open("ctest-tests.json", "r", encoding="utf-8") as f:
               data = json.load(f)
@@ -97,69 +95,70 @@ jobs:
           def sanitize(name):
               return re.sub(r"[^A-Za-z0-9_.-]+", "_", name)
 
-          summary_index = []
+          with open("mutation-results/index.txt", "w", encoding="utf-8") as index_file:
 
-          for index, test in enumerate(tests, start=1):
-              name = test.get("name", f"unknown-test-{index}")
-              safe_name = sanitize(name)
-              report_name = f"{index:03d}_{safe_name}"
+              for index, test in enumerate(tests, start=1):
+                  test_name = test.get("name", f"unknown-test-{index}")
+                  safe_name = sanitize(test_name)
+                  report_name = f"{index:03d}_{safe_name}"
 
-              command = test.get("command", [])
+                  command = test.get("command", [])
 
-              if not command:
-                  print(f"Skipping {name}: no command found.")
-                  continue
+                  if not command:
+                      print(f"Skipping {test_name}: no command found.")
+                      continue
 
-              executable = command[0]
-              args = command[1:]
+                  executable = command[0]
+                  args = command[1:]
 
-              properties = test.get("properties", [])
-              working_directory = "build-mull"
+                  properties = test.get("properties", [])
+                  working_directory = "build-mull"
 
-              for prop in properties:
-                  if prop.get("name") == "WORKING_DIRECTORY":
-                      working_directory = prop.get("value", working_directory)
+                  for prop in properties:
+                      if prop.get("name") == "WORKING_DIRECTORY":
+                          working_directory = prop.get("value", working_directory)
 
-              if not os.path.isabs(executable):
-                  candidate = os.path.join(working_directory, executable)
-                  if os.path.exists(candidate):
-                      executable = candidate
+                  if not os.path.isabs(executable):
+                      candidate = os.path.join(working_directory, executable)
+                      if os.path.exists(candidate):
+                          executable = candidate
 
-              executable = os.path.abspath(executable)
+                  executable = os.path.abspath(executable)
 
-              print("")
-              print("=" * 100)
-              print(f"Running Mull for CTest test: {name}")
-              print(f"Report name: {report_name}")
-              print(f"Executable: {executable}")
-              print(f"Arguments: {args}")
-              print("=" * 100)
+                  log_file = f"mutation-results/{report_name}.txt"
+                  sqlite_name = report_name
 
-              if not os.path.exists(executable):
-                  print(f"Executable not found, skipping: {executable}")
-                  continue
+                  print("")
+                  print("=" * 100)
+                  print(f"Running Mull for CTest test: {test_name}")
+                  print(f"Report name: {report_name}")
+                  print(f"Executable: {executable}")
+                  print(f"Arguments: {args}")
+                  print(f"Log file: {log_file}")
+                  print("=" * 100)
 
-              log_path = f"mutation-results/{report_name}.txt"
+                  index_file.write(f"{report_name} => {test_name} => {log_file}\n")
+                  index_file.flush()
 
-              cmd = [
-                  "mull-runner-19",
-                  "--allow-surviving",
-                  "--mutation-score-threshold", "0",
-                  "--workers", "2",
-                  "--timeout", "60000",
-                  "--reporters", "IDE",
-                  "--reporters", "SQLite",
-                  "--report-dir", "mutation-results",
-                  "--report-name", report_name,
-                  executable,
-              ] + args
+                  if not os.path.exists(executable):
+                      print(f"Executable not found, skipping: {executable}")
+                      with open(log_file, "w", encoding="utf-8") as log:
+                          log.write(f"CTest test name: {test_name}\n")
+                          log.write(f"Executable not found: {executable}\n")
+                      continue
 
-              with open(log_path, "w", encoding="utf-8") as log:
-                  log.write(f"CTest test name: {name}\n")
-                  log.write(f"Executable: {executable}\n")
-                  log.write(f"Arguments: {args}\n")
-                  log.write("=" * 100 + "\n\n")
-                  log.flush()
+                  cmd = [
+                      "mull-runner-19",
+                      "--allow-surviving",
+                      "--mutation-score-threshold", "0",
+                      "--workers", "2",
+                      "--timeout", "60000",
+                      "--reporters", "IDE",
+                      "--reporters", "SQLite",
+                      "--report-dir", "mutation-results",
+                      "--report-name", sqlite_name,
+                      executable,
+                  ] + args
 
                   result = subprocess.run(
                       cmd,
@@ -168,23 +167,20 @@ jobs:
                       text=True
                   )
 
+                  with open(log_file, "w", encoding="utf-8") as log:
+                      log.write(f"CTest test name: {test_name}\n")
+                      log.write(f"Report name: {report_name}\n")
+                      log.write(f"Executable: {executable}\n")
+                      log.write(f"Arguments: {args}\n")
+                      log.write("=" * 100 + "\n\n")
+                      log.write(result.stdout)
+
                   print(result.stdout)
-                  log.write(result.stdout)
 
-              summary_index.append((name, report_name, log_path))
+                  if result.returncode != 0:
+                      print(f"Mull returned non-zero exit code for {test_name}: {result.returncode}")
+                      print("Continuing with next test executable for POC purposes.")
 
-              if result.returncode != 0:
-                  print(f"Mull returned non-zero exit code for {name}: {result.returncode}")
-                  print("Continuing with next test executable for POC purposes.")
-
-          with open("mutation-results/index.txt", "w", encoding="utf-8") as index_file:
-              for name, report_name, log_path in summary_index:
-                  index_file.write(f"{report_name} => {name} => {log_path}\n")
-
-          print("")
-          print("Generated mutation result files:")
-          for name, report_name, log_path in summary_index:
-              print(f"{report_name} => {name} => {log_path}")
           PY
 
       - name: Generate Mull summary report
@@ -194,29 +190,39 @@ jobs:
           ls -la mutation-results || true
 
           echo ""
-          echo "Searching for surviving mutant at thread_synchronization.hpp:200..."
-          grep -R "thread_synchronization.hpp:200" mutation-results/*.txt || true
-
-          echo ""
           echo "CTest test index:"
           cat mutation-results/index.txt || true
 
           echo ""
-          echo "Generating reporter summaries from SQLite files..."
+          echo "Generate summaries from each SQLite database:"
           for db in mutation-results/*.sqlite; do
             if [ -f "$db" ]; then
               base=$(basename "$db" .sqlite)
+
               echo ""
               echo "============================================================"
               echo "Summary for $base"
               echo "============================================================"
+
               mull-reporter-19 --reporters IDE "$db" | tee "mutation-results/${base}_summary.txt" || true
             fi
           done
 
           echo ""
-          echo "Searching again in generated summaries..."
-          grep -R "thread_synchronization.hpp:200" mutation-results/*_summary.txt || true
+          echo "Search for thread_synchronization in all mutation result files:"
+          grep -R "thread_synchronization" mutation-results || true
+
+          echo ""
+          echo "Search specifically for line 200:"
+          grep -R "thread_synchronization.hpp:200" mutation-results || true
+
+          echo ""
+          echo "Search for current + 1:"
+          grep -R "current + 1" mutation-results || true
+
+          echo ""
+          echo "Search for Replaced + with -:"
+          grep -R "Replaced + with -" mutation-results || true
       
       - name: Upload mutation testing results
         if: always()
