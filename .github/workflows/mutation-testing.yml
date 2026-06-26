@@ -33,9 +33,7 @@ jobs:
             - cxx_add_to_sub
 
           includePaths:
-            - ".*/isobus/.*"
             - ".*/utility/.*"
-            - ".*/hardware_integration/.*"
 
           excludePaths:
             - ".*/test/.*"
