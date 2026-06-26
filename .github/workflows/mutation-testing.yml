@@ -33,7 +33,7 @@ jobs:
             - cxx_add_to_sub
 
           includePaths:
-            - ".*/utility/.*"
+            - ".*/utility/include/isobus/utility/thread_synchronization.hpp"
 
           excludePaths:
             - ".*/test/.*"
