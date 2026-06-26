@@ -1,0 +1,170 @@
+name: Mutation testing with Mull
+
+on:
+  workflow_dispatch:
+
+jobs:
+  mutation-testing:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install build tools and Mull
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y curl ca-certificates cmake ninja-build jq python3 clang-19 llvm-19
+
+          curl -1sLf 'https://dl.cloudsmith.io/public/mull-project/mull-stable/setup.deb.sh' | sudo -E bash
+          sudo apt-get update
+          sudo apt-get install -y mull-19
+
+          clang-19 --version
+          clang++-19 --version
+          mull-runner-19 --version
+
+      - name: Create Mull configuration
+        run: |
+          cat > mull.yml << 'EOF'
+          quiet: false
+
+          mutators:
+            - cxx_add_to_sub
+
+          includePaths:
+            - ".*/isobus/.*"
+            - ".*/utility/.*"
+            - ".*/hardware_integration/.*"
+
+          excludePaths:
+            - ".*/test/.*"
+            - ".*/examples/.*"
+            - ".*/docs/.*"
+            - ".*/sphinx/.*"
+          EOF
+
+          cat mull.yml
+
+      - name: Configure project with Mull enabled
+        run: |
+          PLUGIN_PATH=$(find /usr -name "mull-ir-frontend-19*" -type f | head -n 1)
+
+          echo "Mull plugin path: $PLUGIN_PATH"
+
+          cmake -S . -B build-mull -G Ninja \
+            -DBUILD_TESTING=ON \
+            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
+            -DCMAKE_C_COMPILER=clang-19 \
+            -DCMAKE_CXX_COMPILER=clang++-19 \
+            -DCMAKE_C_FLAGS="-g -grecord-command-line -fpass-plugin=$PLUGIN_PATH" \
+            -DCMAKE_CXX_FLAGS="-g -grecord-command-line -fpass-plugin=$PLUGIN_PATH"
+
+      - name: Build project with Mull instrumentation
+        run: |
+          cmake --build build-mull
+
+      - name: Run unit tests normally before mutation testing
+        run: |
+          ctest --test-dir build-mull --output-on-failure
+
+      - name: Discover CTest test executables
+        run: |
+          ctest --test-dir build-mull --show-only=json-v1 > ctest-tests.json
+          cat ctest-tests.json
+
+      - name: Run Mull on discovered test executables
+        run: |
+          mkdir -p mutation-results
+
+          python3 << 'PY'
+          import json
+          import os
+          import subprocess
+          from pathlib import Path
+
+          with open("ctest-tests.json", "r", encoding="utf-8") as f:
+              data = json.load(f)
+
+          tests = data.get("tests", [])
+
+          if not tests:
+              print("No tests discovered by CTest.")
+              raise SystemExit(1)
+
+          print(f"Discovered {len(tests)} CTest tests.")
+
+          for test in tests:
+              name = test.get("name", "unknown-test")
+              command = test.get("command", [])
+
+              if not command:
+                  print(f"Skipping {name}: no command found.")
+                  continue
+
+              executable = command[0]
+              args = command[1:]
+
+              properties = test.get("properties", [])
+              working_directory = "build-mull"
+
+              for prop in properties:
+                  if prop.get("name") == "WORKING_DIRECTORY":
+                      working_directory = prop.get("value", working_directory)
+
+              if not os.path.isabs(executable):
+                  candidate = os.path.join(working_directory, executable)
+                  if os.path.exists(candidate):
+                      executable = candidate
+
+              executable = os.path.abspath(executable)
+
+              print("")
+              print("=" * 80)
+              print(f"Running Mull for CTest test: {name}")
+              print(f"Executable: {executable}")
+              print(f"Arguments: {args}")
+              print("=" * 80)
+
+              if not os.path.exists(executable):
+                  print(f"Executable not found, skipping: {executable}")
+                  continue
+
+              cmd = [
+                  "mull-runner-19",
+                  "--allow-surviving",
+                  "--mutation-score-threshold", "0",
+                  "--workers", "2",
+                  "--timeout", "60000",
+                  "--reporters", "IDE",
+                  "--reporters", "SQLite",
+                  "--report-dir", "mutation-results",
+                  "--report-name", "agisostack",
+                  executable,
+              ] + args
+
+              result = subprocess.run(cmd)
+
+              if result.returncode != 0:
+                  print(f"Mull returned non-zero exit code for {name}: {result.returncode}")
+                  print("Continuing with next test executable for POC purposes.")
+
+          PY
+
+      - name: Generate Mull summary report
+        if: always()
+        run: |
+          ls -la mutation-results || true
+
+          if [ -f mutation-results/agisostack.sqlite ]; then
+            mull-reporter-19 --reporters IDE mutation-results/agisostack.sqlite | tee mutation-results/summary.txt
+          else
+            echo "No SQLite report generated by Mull." | tee mutation-results/summary.txt
+          fi
+
+      - name: Upload mutation testing results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mutation-testing-results
+          path: mutation-results/
