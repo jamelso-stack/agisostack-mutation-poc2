@@ -1,0 +1,31 @@
+
+ame: Run AgIsoStack++ unit tests
+
+on:
+  workflow_dispatch:
+  push:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Récupérer le code
+        uses: actions/checkout@v4
+
+      - name: Installer les outils nécessaires
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake g++ ninja-build
+
+      - name: Configurer le projet avec les tests activés
+        run: |
+          cmake -S . -B build -DBUILD_TESTING=ON
+
+      - name: Compiler le projet
+        run: |
+          cmake --build build
+
+      - name: Exécuter les tests unitaires
+        run: |
+          ctest --test-dir build --output-on-failure
