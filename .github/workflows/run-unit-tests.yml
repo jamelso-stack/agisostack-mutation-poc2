@@ -1,5 +1,4 @@
-
-ame: Run AgIsoStack++ unit tests
+name: Run AgIsoStack++ unit tests
 
 on:
   workflow_dispatch:
