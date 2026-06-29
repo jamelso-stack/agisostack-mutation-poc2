@@ -122,7 +122,7 @@ jobs:
           set -euxo pipefail
           ctest --test-dir "${BUILD_DIR}" --output-on-failure
 
-      - name: Discover CTest executables without printing test names
+      - name: Discover CTest commands without printing test names
         shell: bash
         run: |
           set -euxo pipefail
@@ -137,7 +137,7 @@ jobs:
           with open("ctest-tests.json", "r", encoding="utf-8") as f:
               data = json.load(f)
 
-          executables = []
+          targets = []
           seen = set()
 
           for test in data.get("tests", []):
@@ -145,31 +145,72 @@ jobs:
               if not command:
                   continue
 
-              exe = command[0]
+              properties = {
+                  p.get("name"): p.get("value")
+                  for p in test.get("properties", [])
+                  if "name" in p
+              }
 
-              # Normalize executable path.
+              working_directory = properties.get("WORKING_DIRECTORY")
+              if not working_directory:
+                  working_directory = str(Path("build").resolve())
+              else:
+                  working_directory = str(Path(working_directory).resolve())
+
+              exe = command[0]
+              args = command[1:]
+
               exe_path = Path(exe)
               if not exe_path.is_absolute():
-                  exe_path = Path("build") / exe_path
+                  candidate_from_cwd = Path(working_directory) / exe_path
+                  candidate_from_build = Path("build") / exe_path
+
+                  if candidate_from_cwd.exists():
+                      exe_path = candidate_from_cwd
+                  else:
+                      exe_path = candidate_from_build
 
               exe_path = exe_path.resolve()
 
-              if exe_path.exists() and os.access(exe_path, os.X_OK):
-                  key = str(exe_path)
-                  if key not in seen:
-                      seen.add(key)
-                      executables.append(key)
+              if not exe_path.exists() or not os.access(exe_path, os.X_OK):
+                  continue
 
-          if not executables:
-              raise SystemExit("No CTest executable found. Check CTest registration / add_test configuration.")
+              env_entries = []
+              environment_property = properties.get("ENVIRONMENT")
 
-          with open("mull-test-executables.txt", "w", encoding="utf-8") as f:
-              for exe in executables:
-                  f.write(exe + "\n")
+              if isinstance(environment_property, list):
+                  env_entries = environment_property
+              elif isinstance(environment_property, str):
+                  env_entries = [environment_property]
 
-          print(f"Discovered {len(executables)} unique test executable(s).")
+              key = (
+                  str(exe_path),
+                  tuple(args),
+                  working_directory,
+                  tuple(env_entries),
+              )
+
+              if key in seen:
+                  continue
+
+              seen.add(key)
+
+              targets.append({
+                  "executable": str(exe_path),
+                  "args": args,
+                  "working_directory": working_directory,
+                  "environment": env_entries,
+              })
+
+          if not targets:
+              raise SystemExit("No CTest executable command found. Check CTest registration / add_test configuration.")
+
+          with open("mull-targets.json", "w", encoding="utf-8") as f:
+              json.dump(targets, f, indent=2)
+
+          print(f"Discovered {len(targets)} unique CTest command(s).")
           PY
-   
+        
       - name: Run Mull on all discovered test executables
         shell: bash
         run: |
@@ -177,23 +218,71 @@ jobs:
 
           mkdir -p "${MULL_REPORT_DIR}"
 
-          while IFS= read -r TEST_EXECUTABLE; do
-            echo "Running Mull on one test executable..."
+          python3 <<'PY'
+          import json
+          import os
+          import subprocess
+          import sys
 
-            MULL_CONFIG=./mull.yml mull-runner-${MULL_LLVM_VERSION} \
-              --workers "${MULL_WORKERS}" \
-              --timeout "${MULL_TIMEOUT_MS}" \
-              --minimum-timeout "${MULL_TIMEOUT_MS}" \
-              --include-not-covered \
-              --allow-surviving \
-              --mutation-score-threshold 0 \
-              --no-output \
-              --reporters SQLite \
-              --report-dir "${MULL_REPORT_DIR}" \
-              --report-name "${MULL_REPORT_NAME}" \
-              "${TEST_EXECUTABLE}"
+          mull_version = os.environ["MULL_LLVM_VERSION"]
+          workers = os.environ["MULL_WORKERS"]
+          timeout_ms = os.environ["MULL_TIMEOUT_MS"]
+          report_dir = os.environ["MULL_REPORT_DIR"]
+          report_name = os.environ["MULL_REPORT_NAME"]
 
-          done < mull-test-executables.txt
+          with open("mull-targets.json", "r", encoding="utf-8") as f:
+              targets = json.load(f)
+
+          for index, target in enumerate(targets, start=1):
+              print(f"Running Mull on CTest command {index}/{len(targets)}...")
+
+              env = os.environ.copy()
+              env["MULL_CONFIG"] = "./mull.yml"
+
+              for entry in target.get("environment", []):
+                  if "=" in entry:
+                      key, value = entry.split("=", 1)
+                      env[key] = value
+
+              executable = target["executable"]
+              args = target.get("args", [])
+              working_directory = target.get("working_directory") or os.getcwd()
+
+              command = [
+                  f"mull-runner-{mull_version}",
+                  "--workers", workers,
+                  "--timeout", timeout_ms,
+                  "--minimum-timeout", timeout_ms,
+                  "--include-not-covered",
+                  "--allow-surviving",
+                  "--mutation-score-threshold", "0",
+                  "--no-output",
+                  "--reporters", "SQLite",
+                  "--report-dir", report_dir,
+                  "--report-name", report_name,
+                  executable,
+              ]
+
+              # Important:
+              # CTest arguments may start with --, for example --gtest_filter.
+              # The separator -- tells Mull that following values are runner args.
+              if args:
+                  command.append("--")
+                  command.extend(args)
+
+              result = subprocess.run(
+                  command,
+                  cwd=working_directory,
+                  env=env,
+                  text=True,
+              )
+
+              if result.returncode != 0:
+                  print(f"Mull failed on CTest command {index}/{len(targets)}.")
+                  sys.exit(result.returncode)
+
+          print("Mull completed on all discovered CTest commands.")
+          PY
 
       - name: Generate final mutation score only
         shell: bash
