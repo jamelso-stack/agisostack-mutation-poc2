@@ -1,0 +1,176 @@
+name: Mutation testing - add to sub (cpp except unit tests)
+
+on:
+  workflow_dispatch:
+    inputs:
+      test_binary:
+        description: "Chemin du binaire de tests à lancer avec Mull"
+        required: true
+        default: "./build/test/core_tests"
+      gtest_filter:
+        description: "Filtre GoogleTest optionnel pour réduire la durée, ex: CORE_TESTS.* ; laisser vide pour tout lancer"
+        required: false
+        default: ""
+      max_minutes:
+        description: "Durée max du job GitHub Actions"
+        required: false
+        default: "35"
+      workers:
+        description: "Nombre de workers Mull"
+        required: false
+        default: "2"
+
+concurrency:
+  group: mutation-add-to-sub-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  mutation-add-to-sub:
+    name: Mull + -> - on production .cpp files
+    runs-on: ubuntu-24.04
+    timeout-minutes: ${{ fromJSON(inputs.max_minutes) }}
+
+    env:
+      BUILD_DIR: build
+      MULL_CONFIG: mull-ci-add-to-sub.yml
+      TEST_BINARY: ${{ inputs.test_binary }}
+      GTEST_FILTER: ${{ inputs.gtest_filter }}
+      MULL_WORKERS: ${{ inputs.workers }}
+      LLVM_VERSION: "18"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y \
+            cmake ninja-build clang-${LLVM_VERSION} llvm-${LLVM_VERSION} lld-${LLVM_VERSION} \
+            libclang-${LLVM_VERSION}-dev curl ca-certificates gnupg
+
+      - name: Install Mull if missing
+        run: |
+          set -euxo pipefail
+          if command -v mull-runner-${LLVM_VERSION} >/dev/null 2>&1; then
+            echo "Mull already installed: $(command -v mull-runner-${LLVM_VERSION})"
+            exit 0
+          fi
+
+          curl -1sLf 'https://dl.cloudsmith.io/public/mull-project/mull-stable/setup.deb.sh' | sudo -E bash || \
+          curl -1sLf 'https://packagecloud.io/install/repositories/mull-project/mull/script.deb.sh' | sudo -E bash
+
+          sudo apt-get update
+          sudo apt-get install -y mull-${LLVM_VERSION}
+
+      - name: Show tool versions
+        run: |
+          set -euxo pipefail
+          clang-${LLVM_VERSION} --version
+          cmake --version
+          mull-runner-${LLVM_VERSION} --version
+
+      - name: Create Mull config for + to - on .cpp except unit tests
+        run: |
+          cat > ${MULL_CONFIG} <<'EOF'
+mutators:
+  - cxx_add_to_sub
+
+# Tous les fichiers C++ de production.
+includePaths:
+  - '.*\.cpp$'
+
+# Exclusions : tests unitaires, dossiers de tests, build, dépendances externes.
+excludePaths:
+  # Dossiers de tests fréquents
+  - '.*/test/.*'
+  - '.*/tests/.*'
+  - '.*/unit[_-]?tests?/.*'
+  - '.*/unittests?/.*'
+  - '.*/gtest/.*'
+  - '.*/googletest/.*'
+
+  # Noms de fichiers de tests fréquents
+  - '.*[Tt]est\.cpp$'
+  - '.*[Tt]ests\.cpp$'
+  - '.*_test\.cpp$'
+  - '.*_tests\.cpp$'
+  - '.*-test\.cpp$'
+  - '.*-tests\.cpp$'
+  - '.*\.test\.cpp$'
+  - '.*\.tests\.cpp$'
+  - '.*_ut\.cpp$'
+  - '.*-ut\.cpp$'
+
+  # Artefacts et dépendances à ne pas muter
+  - '.*/build/.*'
+  - '.*/cmake-build-.*/.*'
+  - '.*/third[_-]party/.*'
+  - '.*/external/.*'
+  - '.*/extern/.*'
+  - '.*/vendor/.*'
+  - '.*/dependencies/.*'
+EOF
+          cat ${MULL_CONFIG}
+
+      - name: Configure CMake with Mull instrumentation
+        run: |
+          set -euxo pipefail
+          cmake -S . -B ${BUILD_DIR} -G Ninja \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_C_COMPILER=clang-${LLVM_VERSION} \
+            -DCMAKE_CXX_COMPILER=clang++-${LLVM_VERSION} \
+            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
+            -DCMAKE_C_FLAGS="-g -grecord-command-line -fpass-plugin=/usr/lib/mull-ir-frontend-${LLVM_VERSION}" \
+            -DCMAKE_CXX_FLAGS="-g -grecord-command-line -fpass-plugin=/usr/lib/mull-ir-frontend-${LLVM_VERSION}" \
+            -DCMAKE_EXE_LINKER_FLAGS="-fuse-ld=lld-${LLVM_VERSION}" \
+            -DBUILD_TESTING=ON
+
+      - name: Build
+        run: |
+          set -euxo pipefail
+          cmake --build ${BUILD_DIR} -j2
+
+      - name: Run regular tests first with bounded time
+        run: |
+          set -euxo pipefail
+          ctest --test-dir ${BUILD_DIR} --output-on-failure --timeout 120 -j2
+
+      - name: Check test binary exists
+        run: |
+          set -euxo pipefail
+          test -x "${TEST_BINARY}"
+
+      - name: Run Mull mutation testing (+ -> -) on .cpp except unit tests
+        run: |
+          set -euxo pipefail
+          mkdir -p mull-report
+
+          MULL_ARGS=(
+            --workers "${MULL_WORKERS}"
+            --timeout 30000
+            --minimum-timeout 1000
+            --reporters IDE
+            --reporters GitHubAnnotations
+            --reporters Elements
+            --report-dir mull-report
+            --allow-surviving
+            --mutation-score-threshold 0
+            --no-output
+            "${TEST_BINARY}"
+          )
+
+          if [ -n "${GTEST_FILTER}" ]; then
+            mull-runner-${LLVM_VERSION} "${MULL_ARGS[@]}" -- --gtest_filter="${GTEST_FILTER}"
+          else
+            mull-runner-${LLVM_VERSION} "${MULL_ARGS[@]}"
+          fi
+
+      - name: Upload Mull report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mull-add-to-sub-report
+          path: mull-report
+          if-no-files-found: warn
