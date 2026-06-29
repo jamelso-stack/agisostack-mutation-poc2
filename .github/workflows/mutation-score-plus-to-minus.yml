@@ -13,7 +13,7 @@ on:
 
 env:
   BUILD_DIR: build
-  MULL_LLVM_VERSION: "22"
+  MULL_LLVM_VERSION: "19"
   MULL_REPORT_DIR: mull-report
   MULL_REPORT_NAME: agisostack-plus-to-minus
   MULL_WORKERS: "2"
