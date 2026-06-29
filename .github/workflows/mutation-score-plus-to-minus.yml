@@ -169,7 +169,7 @@ jobs:
 
           print(f"Discovered {len(executables)} unique test executable(s).")
           PY
-
+   
       - name: Run Mull on all discovered test executables
         shell: bash
         run: |
@@ -180,8 +180,7 @@ jobs:
           while IFS= read -r TEST_EXECUTABLE; do
             echo "Running Mull on one test executable..."
 
-            mull-runner-${MULL_LLVM_VERSION} \
-              --config ./mull.yml \
+            MULL_CONFIG=./mull.yml mull-runner-${MULL_LLVM_VERSION} \
               --workers "${MULL_WORKERS}" \
               --timeout "${MULL_TIMEOUT_MS}" \
               --minimum-timeout "${MULL_TIMEOUT_MS}" \
