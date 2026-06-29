@@ -1,0 +1,236 @@
+name: Mutation Score - Plus to Minus
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches:
+      - main
+      - master
+  push:
+    branches:
+      - main
+      - master
+
+env:
+  BUILD_DIR: build
+  MULL_LLVM_VERSION: "22"
+  MULL_REPORT_DIR: mull-report
+  MULL_REPORT_NAME: agisostack-plus-to-minus
+  MULL_WORKERS: "2"
+  MULL_TIMEOUT_MS: "120000"
+
+jobs:
+  mutation-score-plus-to-minus:
+    name: Mull mutation score cxx_add_to_sub
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies, LLVM and Mull
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          sudo apt-get update
+          sudo apt-get install -y \
+            curl \
+            ca-certificates \
+            gnupg \
+            lsb-release \
+            software-properties-common \
+            cmake \
+            ninja-build \
+            python3 \
+            sqlite3
+
+          # LLVM / Clang.
+          # The Mull package version must match the LLVM/Clang version used to build the project.
+          curl -fsSL https://apt.llvm.org/llvm.sh -o llvm.sh
+          chmod +x llvm.sh
+          sudo ./llvm.sh "${MULL_LLVM_VERSION}"
+
+          # Mull stable repository.
+          curl -1sLf 'https://dl.cloudsmith.io/public/mull-project/mull-stable/setup.deb.sh' | sudo -E bash
+          sudo apt-get update
+          sudo apt-get install -y "mull-${MULL_LLVM_VERSION}"
+
+          clang++-${MULL_LLVM_VERSION} --version
+          mull-runner-${MULL_LLVM_VERSION} --version
+          mull-reporter-${MULL_LLVM_VERSION} --version
+
+          test -f "/usr/lib/mull-ir-frontend-${MULL_LLVM_VERSION}"
+
+      - name: Create Mull configuration
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          cat > mull.yml <<'EOF'
+          mutators:
+            - cxx_add_to_sub
+
+          # On veut analyser le code du projet, pas les dépendances vendored ni le dossier de build.
+          # Si tu veux vraiment muter aussi les tests, supprime les lignes .*test.* et .*gtest.* ci-dessous.
+          includePaths:
+            - .*
+
+          excludePaths:
+            - .*/build/.*
+            - .*/cmake-build-.*
+            - .*/_deps/.*
+            - .*/third_party/.*
+            - .*/external/.*
+            - .*/vendor/.*
+            - .*/googletest/.*
+            - .*/gtest/.*
+            - .*/gmock/.*
+            - .*test.*
+            - .*Test.*
+            - .*tests.*
+            - .*Tests.*
+          EOF
+
+          cat mull.yml
+
+      - name: Configure CMake with Mull instrumentation
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          export CC="clang-${MULL_LLVM_VERSION}"
+          export CXX="clang++-${MULL_LLVM_VERSION}"
+
+          cmake -S . -B "${BUILD_DIR}" -G Ninja \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_CXX_FLAGS="-O0 -g -grecord-command-line -fpass-plugin=/usr/lib/mull-ir-frontend-${MULL_LLVM_VERSION}" \
+            -DCMAKE_C_FLAGS="-O0 -g -grecord-command-line -fpass-plugin=/usr/lib/mull-ir-frontend-${MULL_LLVM_VERSION}" \
+            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
+            -DBUILD_TESTING=ON
+
+      - name: Build
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cmake --build "${BUILD_DIR}" --parallel "$(nproc)"
+
+      - name: Baseline tests
+        shell: bash
+        run: |
+          set -euxo pipefail
+          ctest --test-dir "${BUILD_DIR}" --output-on-failure
+
+      - name: Discover CTest executables without printing test names
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          ctest --test-dir "${BUILD_DIR}" --show-only=json-v1 > ctest-tests.json
+
+          python3 <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          with open("ctest-tests.json", "r", encoding="utf-8") as f:
+              data = json.load(f)
+
+          executables = []
+          seen = set()
+
+          for test in data.get("tests", []):
+              command = test.get("command", [])
+              if not command:
+                  continue
+
+              exe = command[0]
+
+              # Normalize executable path.
+              exe_path = Path(exe)
+              if not exe_path.is_absolute():
+                  exe_path = Path("build") / exe_path
+
+              exe_path = exe_path.resolve()
+
+              if exe_path.exists() and os.access(exe_path, os.X_OK):
+                  key = str(exe_path)
+                  if key not in seen:
+                      seen.add(key)
+                      executables.append(key)
+
+          if not executables:
+              raise SystemExit("No CTest executable found. Check CTest registration / add_test configuration.")
+
+          with open("mull-test-executables.txt", "w", encoding="utf-8") as f:
+              for exe in executables:
+                  f.write(exe + "\n")
+
+          print(f"Discovered {len(executables)} unique test executable(s).")
+          PY
+
+      - name: Run Mull on all discovered test executables
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          mkdir -p "${MULL_REPORT_DIR}"
+
+          while IFS= read -r TEST_EXECUTABLE; do
+            echo "Running Mull on one test executable..."
+
+            mull-runner-${MULL_LLVM_VERSION} \
+              --config ./mull.yml \
+              --workers "${MULL_WORKERS}" \
+              --timeout "${MULL_TIMEOUT_MS}" \
+              --minimum-timeout "${MULL_TIMEOUT_MS}" \
+              --include-not-covered \
+              --allow-surviving \
+              --mutation-score-threshold 0 \
+              --no-output \
+              --reporters SQLite \
+              --report-dir "${MULL_REPORT_DIR}" \
+              --report-name "${MULL_REPORT_NAME}" \
+              "${TEST_EXECUTABLE}"
+
+          done < mull-test-executables.txt
+
+      - name: Generate final mutation score only
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          SQLITE_REPORT="${MULL_REPORT_DIR}/${MULL_REPORT_NAME}.sqlite"
+
+          test -f "${SQLITE_REPORT}"
+
+          # Generate the full Mull report internally, but do not print surviving mutants in the GitHub log.
+          mull-reporter-${MULL_LLVM_VERSION} \
+            --allow-surviving \
+            --mutation-score-threshold 0 \
+            --reporters IDE \
+            "${SQLITE_REPORT}" \
+            > "${MULL_REPORT_DIR}/final-mull-report.txt"
+
+          {
+            echo "## Mutation testing result"
+            echo ""
+            echo "- Mutator: \`cxx_add_to_sub\`"
+            echo "- Mutation: \`+\` vers \`-\`"
+            echo "- Scope: project sources configured in \`mull.yml\`"
+            echo ""
+            grep -E "Mutation score|Surviving mutants|Total reporting time|Total execution time" "${MULL_REPORT_DIR}/final-mull-report.txt" || true
+          } | tee "${MULL_REPORT_DIR}/mutation-score-summary.md"
+
+          cat "${MULL_REPORT_DIR}/mutation-score-summary.md" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload mutation score artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: mull-plus-to-minus-mutation-score
+          path: |
+            mull.yml
+            mull-report/agisostack-plus-to-minus.sqlite
+            mull-report/mutation-score-summary.md
+          if-no-files-found: error
